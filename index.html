@@ -418,12 +418,17 @@ const Sound = (() => {
     if (ctx) return true;
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return false;
-    try { ctx = new AC(); } catch (e) { return false; }
+    try { ctx = new AC({ latencyHint: "playback" }); } catch (e) { try { ctx = new AC(); } catch (e2) { return false; } }
+    // every sound part made inside a voice() ... done() pair gets disconnected once that note has finished
+    for (const name of ["createGain", "createBiquadFilter", "createOscillator", "createBufferSource", "createWaveShaper"]) {
+      const orig = ctx[name].bind(ctx);
+      ctx[name] = (...a) => { const n = orig(...a); if (bags.length) bags[bags.length - 1].push(n); return n; };
+    }
     const comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -18; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
     const master = ctx.createGain(); master.gain.value = 0.9;
     master.connect(comp); comp.connect(ctx.destination);
-    verb = ctx.createConvolver(); verb.buffer = impulse(3, 2.5);
+    verb = ctx.createConvolver(); verb.buffer = impulse(1.7, 2.6);
     const verbOut = ctx.createGain(); verbOut.gain.value = 0.6; verb.connect(verbOut); verbOut.connect(master);
     musicBus = ctx.createGain(); musicBus.gain.value = 0; musicBus.connect(master);
     const ms = ctx.createGain(); ms.gain.value = 0.36; musicBus.connect(ms); ms.connect(verb);
@@ -438,9 +443,22 @@ const Sound = (() => {
     return true;
   }
   function impulse(sec, decay) {
-    const len = Math.floor(ctx.sampleRate * sec), b = ctx.createBuffer(2, len, ctx.sampleRate);
-    for (let ch = 0; ch < 2; ch++) { const d = b.getChannelData(ch); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay); }
+    const len = Math.floor(ctx.sampleRate * sec), b = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = b.getChannelData(0); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
     return b;
+  }
+  const bags = [];
+  function voice() { const b = []; bags.push(b); return b; }
+  function done(bag, end) {
+    bags.pop();
+    const reap = () => {
+      if (!ctx) return;
+      const left = end + 0.3 - ctx.currentTime;
+      if (left > 0) { setTimeout(reap, Math.max(250, left * 1000)); return; }
+      for (const n of bag) { try { n.disconnect(); } catch (e) {} }
+      bag.length = 0;
+    };
+    setTimeout(reap, Math.max(250, (end + 0.3 - ctx.currentTime) * 1000));
   }
   function osc(type, freq, t, end, out, gain = 1) {
     const o = ctx.createOscillator(); o.type = type; o.frequency.value = freq;
@@ -479,14 +497,17 @@ const Sound = (() => {
 
   /* ----- instruments ----- */
   function bell(t, midi, vel, out, len = 2.4, bright = 1) {
+    const V = voice();
     const f = mtof(midi), g = ctx.createGain();
     g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vel, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + len);
     const lp = ctx.createBiquadFilter(); lp.type = "lowpass";
     lp.frequency.setValueAtTime(Math.min(10000, f * 6 * bright), t); lp.frequency.exponentialRampToValueAtTime(Math.max(300, f * 1.5), t + len);
     g.connect(lp); lp.connect(out);
     for (const [m, a] of [[1, 1], [2, 0.3 * bright], [3, 0.08 * bright], [1.003, 0.45]]) osc("sine", f * m, t, t + len + 0.05, g, a);
+    done(V, t + len + 0.05);
   }
   function oud(t, midi, vel, len = 0.55, out = musicBus) {
+    const V = voice();
     const f = mtof(midi), g = ctx.createGain();
     g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vel, t + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t + len);
     const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.Q.value = 2;
@@ -496,8 +517,10 @@ const Sound = (() => {
       const o = osc(type, f * m, t, t + len + 0.05, g, a);
       o.detune.setValueAtTime(28, t); o.detune.exponentialRampToValueAtTime(1, t + 0.05);
     }
+    done(V, t + len + 0.05);
   }
   function qanun(t, midi, vel, len = 0.9, out = musicBus) {
+    const V = voice();
     const f = mtof(midi), g = ctx.createGain();
     g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vel, t + 0.003); g.gain.exponentialRampToValueAtTime(0.0001, t + len);
     const lp = ctx.createBiquadFilter(); lp.type = "lowpass";
@@ -506,23 +529,27 @@ const Sound = (() => {
     osc("sawtooth", f, t, t + len + 0.05, g, 0.45);
     osc("triangle", f * 1.002, t, t + len + 0.05, g, 0.7);
     osc("sine", f * 3, t, t + len * 0.4, g, 0.12);
+    done(V, t + len + 0.05);
   }
   // Egyptian string section: many violins in unison, sliding between notes with a warm vibrato
   function strings(t, m, dur, orn, scale, vel = 0.05, out = musicBus, prev = lastStr) {
+    const V = voice();
     const end = t + dur, g = envGain(t, dur, vel, 0.05, 0.12);
     const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 3200; lp.Q.value = 0.7;
     const body = ctx.createBiquadFilter(); body.type = "peaking"; body.frequency.value = 900; body.gain.value = 4; body.Q.value = 1;
     g.connect(body); body.connect(lp); lp.connect(out);
     const vib = vibrato(t, end + 0.2, 5.6, 12, 0.18);
-    for (const det of [-14, -6, 0, 7, 15]) {
-      const o = osc("sawtooth", 440, t, end + 0.2, g, 0.2);
+    for (const det of [-11, 0, 11]) {
+      const o = osc("sawtooth", 440, t, end + 0.2, g, 0.32);
       o.detune.value = det; vib.connect(o.detune);
       pitch(o.frequency, 1, t, dur, m, orn, scale, prev);
     }
     if (out === musicBus) lastStr = m;
+    done(V, t + dur + 0.3);
   }
   // shaabi accordion: two reeds tuned apart (musette) plus a low reed, with the bellows shake
   function accordion(t, m, dur, orn, scale, vel = 0.06, out = musicBus) {
+    const V = voice();
     const end = t + dur, g = envGain(t, dur, vel, 0.02, 0.06);
     const trem = ctx.createGain(); trem.gain.value = 0.85;
     const tl = ctx.createOscillator(); tl.frequency.value = 6.8;
@@ -536,9 +563,11 @@ const Sound = (() => {
       pitch(o.frequency, ratio, t, dur, m, orn, scale, lastAcc);
     }
     if (out === musicBus) lastAcc = m;
+    done(V, t + dur + 0.15);
   }
   let rasp = null;
   function mizmar(t, m, dur, orn, scale, vel = 0.07, out = musicBus) {
+    const V = voice();
     if (!rasp) { rasp = new Float32Array(256); for (let i = 0; i < 256; i++) { const x = i / 128 - 1; rasp[i] = Math.tanh(x * 2.2); } }
     const end = t + dur, g = envGain(t, dur, vel, 0.035, 0.05);
     const ws = ctx.createWaveShaper(); ws.curve = rasp;
@@ -554,8 +583,10 @@ const Sound = (() => {
       o.detune.value = det; vib.connect(o.detune);
       pitch(o.frequency, 1, t, dur, m, orn, scale);
     }
+    done(V, t + dur + 0.15);
   }
   function ney(t, m, dur, orn, scale, vel = 0.11, out = musicBus) {
+    const V = voice();
     const end = t + dur, g = envGain(t, dur, vel, 0.09, 0.15);
     const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = Math.min(6000, mtof(m) * 4);
     g.connect(lp); lp.connect(out);
@@ -566,38 +597,58 @@ const Sound = (() => {
       pitch(o.frequency, ratio, t, dur, m, orn, scale);
     }
     noise(t, dur + 0.1, "bandpass", mtof(m) * 1.6, mtof(m) * 1.6, vel * 0.22, out, 0.2, 1.5);
+    done(V, t + dur + 0.3);
   }
-  // low strings holding the tonic and fifth
-  function drone(t, dur) {
+  // low strings holding the tonic and fifth: built once and left running while the music plays
+  let droneParts = null;
+  function droneStart(t) {
+    if (droneParts) return;
     const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 700;
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.26, t + 0.3); g.gain.setValueAtTime(0.26, t + dur); g.gain.linearRampToValueAtTime(0, t + dur + 0.4);
+    const g = ctx.createGain(); g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.26, t + 0.6);
     lp.connect(g); g.connect(musicBus);
-    for (const m of [38, 50, 57]) for (const det of [-7, 7]) {
-      const o = osc("sawtooth", mtof(m), t, t + dur + 0.5, lp, m === 38 ? 0.03 : 0.022); o.detune.value = det;
+    const oscs = [];
+    for (const [m, det, a] of [[38, -6, 0.03], [50, 6, 0.024], [57, -5, 0.022]]) {
+      const o = ctx.createOscillator(); o.type = "sawtooth"; o.frequency.value = mtof(m); o.detune.value = det;
+      const og = ctx.createGain(); og.gain.value = a; o.connect(og); og.connect(lp); o.start(t);
+      oscs.push(o, og);
     }
+    droneParts = { lp, g, oscs };
+  }
+  function droneStop() {
+    if (!droneParts) return;
+    const { lp, g, oscs } = droneParts; droneParts = null;
+    const t = ctx.currentTime;
+    g.gain.cancelScheduledValues(t); g.gain.setValueAtTime(g.gain.value, t); g.gain.linearRampToValueAtTime(0, t + 0.8);
+    for (const n of oscs) if (n.stop) n.stop(t + 0.9);
+    setTimeout(() => { for (const n of [...oscs, lp, g]) { try { n.disconnect(); } catch (e) {} } }, 1300);
   }
   function noise(t, dur, type, f0, f1, vel, out = sfxBus, attack = 0.3, q = 1.2) {
+    const V = voice();
     const s = ctx.createBufferSource(); s.buffer = noiseBuf;
     const f = ctx.createBiquadFilter(); f.type = type; f.Q.value = q;
     f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(f1, t + dur);
     const g = ctx.createGain();
     g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vel, t + Math.max(0.002, dur * attack)); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     s.connect(f); f.connect(g); g.connect(out); s.start(t, Math.random() * 0.3); s.stop(t + dur + 0.05);
+    done(V, t + dur + 0.05);
   }
   /* ----- percussion: tabla (darbuka), tabl baladi, riq, sagat, sistrum ----- */
   function dum(t, vel, out = musicBus, low = 62, len = 0.4) {
+    const V = voice();
     const o = ctx.createOscillator(); o.type = "sine";
     o.frequency.setValueAtTime(low * 1.9, t); o.frequency.exponentialRampToValueAtTime(low, t + 0.1);
     const g = ctx.createGain(); g.gain.setValueAtTime(vel, t); g.gain.exponentialRampToValueAtTime(0.0001, t + len);
     o.connect(g); g.connect(out); o.start(t); o.stop(t + len + 0.05);
     noise(t, 0.08, "lowpass", 600, 200, vel * 0.3, out, 0.05);
+    done(V, t + len + 0.05);
   }
   function tek(t, vel, out = musicBus) {
+    const V = voice();
     noise(t, 0.07, "bandpass", 3300, 2800, vel, out, 0.05, 2.5);
     const o = ctx.createOscillator(); o.type = "sine"; o.frequency.value = 650;
     const g = ctx.createGain(); g.gain.setValueAtTime(vel * 0.5, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.035);
     o.connect(g); g.connect(out); o.start(t); o.stop(t + 0.05);
+    done(V, t + 0.08);
   }
   function tabl(t, vel, out = musicBus) {   // the big Saidi bass drum
     dum(t, vel, out, 46, 0.6);
@@ -612,12 +663,15 @@ const Sound = (() => {
     for (let i = 0; i < n; i++) riq(t + i * 0.045, vel * (0.4 + 0.6 * i / n), out);
   }
   function sagat(t, vel, out = musicBus) {
+    const V = voice();
     const g = ctx.createGain(); g.gain.setValueAtTime(vel, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
     g.connect(out);
     for (const [f, a] of [[3150, 1], [4720, 0.7], [6380, 0.5], [8030, 0.3]]) osc("sine", f, t, t + 0.4, g, a);
     noise(t, 0.05, "highpass", 6000, 8000, vel * 0.8, out, 0.05);
+    done(V, t + 0.4);
   }
-  function sistrum(t, vel, out = sfxBus) {   // the ancient Egyptian temple rattle
+  function sistrum(t, vel, out = sfxBus) {
+    const V = voice();   // the ancient Egyptian temple rattle
     const hits = [0, 0.05, 0.09, 0.12, 0.15, 0.3, 0.35, 0.39, 0.42, 0.45, 0.6, 0.66];
     hits.forEach((h, i) => {
       const v = vel * (i % 5 === 0 ? 1 : 0.6), tt = t + h;
@@ -626,9 +680,11 @@ const Sound = (() => {
       for (const [f, a] of [[2650, 1], [3980, 0.7], [5310, 0.5]]) osc("sine", f * (0.98 + Math.random() * 0.04), tt, tt + 0.14, g, a);
       noise(tt, 0.06, "highpass", 5000, 7000, v * 0.7, out, 0.05);
     });
+    done(V, t + 0.85);
   }
   // zaghrouta: the joyful Egyptian celebration cry (a high voice with a fast tongue trill)
   function zaghrouta(t, vel = 0.1, out = sfxBus) {
+    const V = voice();
     const dur = 1.6;
     const o = ctx.createOscillator(); o.type = "sawtooth";
     o.frequency.setValueAtTime(760, t); o.frequency.linearRampToValueAtTime(880, t + 0.25);
@@ -646,6 +702,7 @@ const Sound = (() => {
     const mix = ctx.createGain(); mix.gain.value = 1;
     o.connect(b1); o.connect(b2); b1.connect(mix); b2.connect(mix); mix.connect(amp); amp.connect(env); env.connect(out);
     o.start(t); o.stop(t + dur + 0.15); lfo.start(t); lfo.stop(t + dur + 0.15);
+    done(V, t + 1.8);
   }
 
   /* ----- the arrangement ----- */
@@ -669,14 +726,13 @@ const Sound = (() => {
   function schedule(t, st) {
     const bar = Math.floor(st / BAR), s = st % BAR;
     const plan = PLAN[Math.floor(bar / 4) % 4], inPhrase = bar % 4;
-    if (s === 0) drone(t, BAR * STEP);
     rhythm(t, s, plan.rhythm, inPhrase === 3);
     for (const [at, m, len, orn] of PHRASE[plan.p][inPhrase]) {
       if (at !== s) continue;
       const dur = len * STEP;
       if (plan.lead === "strings") {
         strings(t, m, dur * 0.98, orn, plan.scale);
-        if (len >= 2) for (let k = 0; k < len * 2; k++) qanun(t + k * STEP / 2, m + 12, 0.03, 0.35);
+        if (len >= 2) for (let k = 0; k < len; k++) qanun(t + k * STEP, m + 12, 0.03, 0.4);
       } else if (plan.lead === "accordion") {
         accordion(t, m, dur * 0.85, orn, plan.scale);
         oud(t, m - 12, 0.07, 0.4);
@@ -686,7 +742,7 @@ const Sound = (() => {
         strings(t, m, dur * 0.98, orn, plan.scale, 0.045);
         accordion(t, m - 12, dur * 0.85, orn, plan.scale, 0.04);
         qanun(t, m + 12, 0.045, 0.6);
-        if (len >= 2) for (let k = 1; k < len * 2; k++) qanun(t + k * STEP / 2, m + 12, 0.03, 0.35);
+        if (len >= 2) for (let k = 1; k < len; k++) qanun(t + k * STEP, m + 12, 0.03, 0.4);
       }
     }
   }
@@ -698,6 +754,7 @@ const Sound = (() => {
     const now = ctx.currentTime;
     musicBus.gain.cancelScheduledValues(now); musicBus.gain.setValueAtTime(musicBus.gain.value, now);
     musicBus.gain.linearRampToValueAtTime(0.5, now + 0.4);
+    droneStart(nextT);
     tick(); timer = setInterval(tick, 120);
   }
   // opening flourish: the strings run up the maqam over a tabla roll
@@ -718,6 +775,7 @@ const Sound = (() => {
     const now = ctx.currentTime;
     musicBus.gain.cancelScheduledValues(now); musicBus.gain.setValueAtTime(musicBus.gain.value, now);
     musicBus.gain.linearRampToValueAtTime(0, now + 0.8);
+    droneStop();
   }
   function unlock() {
     keepAlive();
